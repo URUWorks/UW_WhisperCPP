@@ -245,7 +245,7 @@ jobs:
       - name: Empaquetar
         run: |
           cd dist
-          for d in */; do d=${d%/}; (cd "$d" && chmod +x whisper-cli main 2>/dev/null; zip -qry "../$d.zip" .); done
+          for d in */; do d=${d%/}; (cd "$d" && { chmod +x whisper-cli main 2>/dev/null || true; } && zip -qry "../$d.zip" .); done
           ls -la
       - name: Publicar
         env:
