@@ -8,6 +8,9 @@ VER="$1"; PREFIX="$2"
 : "${MACOS_MIN:=10.11}"
 curl -fsSL -o llvm.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-$VER/llvm-project-$VER.src.tar.xz"
 tar xf llvm.tar.xz
+# libc++ usa utimensat (macOS 10.13+); por debajo de 10.13 usamos su alternativa con utimes
+sed -i '' 's/^#if defined(UTIME_OMIT)$/#if defined(UTIME_OMIT) \&\& !(defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) \&\& __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ < 101300)/' "llvm-project-$VER.src/libcxx/src/filesystem/time_utils.h"
+grep -n 'defined(UTIME_OMIT)' "llvm-project-$VER.src/libcxx/src/filesystem/time_utils.h"
 cmake -S "llvm-project-$VER.src/runtimes" -B build-libcxx -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_ARCHITECTURES=x86_64 \
