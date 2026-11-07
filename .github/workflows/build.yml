@@ -1,0 +1,258 @@
+name: Compilar whisper.cpp
+
+# Una vez al mes (día 1, 04:00 UTC) mira la última versión de ggml-org/whisper.cpp.
+# Si todavía no hay una Release nuestra con ese número, compila todo y la publica como "latest",
+# así los demás workflows pueden bajar UW_WhisperCPP/releases/latest/download/<zip>.
+# También se puede lanzar a mano (Actions > Compilar whisper.cpp > Run workflow).
+on:
+  schedule:
+    - cron: '0 4 1 * *'
+  workflow_dispatch:
+    inputs:
+      whisper_version:
+        description: 'Tag de whisper.cpp (vacío = el último)'
+        default: ''
+        required: false
+      macos_min:
+        description: 'Versión mínima de macOS para Intel'
+        default: '10.11'
+        required: true
+      force:
+        description: 'Compilar aunque ya exista la Release'
+        type: boolean
+        default: false
+
+env:
+  MACOS_MIN: ${{ github.event.inputs.macos_min || '10.11' }}
+  LLVM_VERSION: '19.1.7'
+
+jobs:
+  prepare:
+    name: Comprobar versión
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      build: ${{ steps.v.outputs.build }}
+    steps:
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ github.event.inputs.whisper_version }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          V="$INPUT_VERSION"
+          [ -n "$V" ] || V=$(gh api repos/ggml-org/whisper.cpp/releases/latest --jq .tag_name)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" != "true" ] && gh release view "$V" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Ya existe la Release $V: no hay nada que compilar."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Se compilará whisper.cpp $V"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  linux:
+    name: Linux ${{ matrix.arch }} (glibc 2.17+)
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    env:
+      WHISPER_VERSION: ${{ needs.prepare.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            pkg: whisper_linux
+            vulkan: true
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            pkg: whisper_linux_arm64
+            vulkan: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Descargar whisper.cpp
+        run: git clone --depth 1 -b "$WHISPER_VERSION" https://github.com/ggml-org/whisper.cpp src
+      # Vulkan (GPU): cabeceras, loader y glslc compilados en manylinux2014 (tarda ~10 min, se guarda en caché)
+      - name: Caché de dependencias de Vulkan
+        if: matrix.vulkan
+        id: cache-vk
+        uses: actions/cache@v4
+        with:
+          path: vkdeps
+          key: vkdeps-${{ matrix.arch }}-${{ hashFiles('scripts/build-vulkan-deps-linux.sh') }}
+      - name: Compilar dependencias de Vulkan
+        if: matrix.vulkan && steps.cache-vk.outputs.cache-hit != 'true'
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w quay.io/pypa/manylinux2014_${{ matrix.arch }} \
+            bash /w/scripts/build-vulkan-deps-linux.sh /w/vkdeps
+      # manylinux2014 = CentOS 7, glibc 2.17. Se ejecuta con docker run porque las
+      # acciones de Node no funcionan dentro de un contenedor con una glibc tan vieja.
+      - name: Compilar en manylinux2014
+        run: |
+          VK=""; [ "${{ matrix.vulkan }}" = "true" ] && VK="-e VULKAN_PREFIX=/w/vkdeps"
+          docker run --rm $VK -v "$PWD:/w" -w /w quay.io/pypa/manylinux2014_${{ matrix.arch }} \
+            bash /w/scripts/build-linux.sh /w/src /w/out/${{ matrix.pkg }}
+      # Sin Vulkan instalado, ggml-vulkan no se carga y debe seguir con la CPU.
+      - name: Prueba en CentOS 7 y Ubuntu 18.04
+        run: |
+          for img in centos:7 ubuntu:18.04; do
+            echo "== $img"
+            docker run --rm -v "$PWD:/w" -w /w "$img" \
+              ./out/${{ matrix.pkg }}/whisper-cli -m src/models/for-tests-ggml-tiny.bin -f src/samples/jfk.wav -t 2 2>&1 \
+              | tee log.txt | grep -E 'load_backend|total time'
+            grep -q 'total time' log.txt
+          done
+      - name: Prueba con Vulkan (Ubuntu 22.04 + Mesa)
+        if: matrix.vulkan
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w ubuntu:22.04 bash -c '
+            apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libvulkan1 mesa-vulkan-drivers >/dev/null
+            ./out/${{ matrix.pkg }}/whisper-cli -m src/models/for-tests-ggml-tiny.bin -f src/samples/jfk.wav -t 2 2>&1' \
+            | tee log.txt | grep -E 'load_backend|ggml_vulkan|total time'
+          grep -q 'loaded Vulkan backend' log.txt
+          grep -q 'total time' log.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.pkg }}
+          path: out/${{ matrix.pkg }}
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    env:
+      WHISPER_VERSION: ${{ needs.prepare.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2022
+            pkg: whisper_win64
+            check: ''
+          - arch: arm64
+            runner: windows-11-arm
+            pkg: whisper_winarm64
+            check: '--solo-runtime'
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Descargar whisper.cpp
+        run: git clone --depth 1 -b $env:WHISPER_VERSION https://github.com/ggml-org/whisper.cpp src
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+      - name: SDK de Vulkan (x64)
+        if: matrix.arch == 'x64'
+        run: |
+          curl.exe -sSfL -o "$env:RUNNER_TEMP\vulkan_sdk.exe" https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe
+          & "$env:RUNNER_TEMP\vulkan_sdk.exe" --accept-licenses --default-answer --confirm-command install
+          $sdk = (Get-ChildItem C:\VulkanSDK -Directory | Sort-Object Name | Select-Object -Last 1).FullName
+          "VULKAN_SDK=$sdk" | Out-File -Append $env:GITHUB_ENV
+          "$sdk\Bin" | Out-File -Append $env:GITHUB_PATH
+      - name: Ninja y clang (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) { choco install llvm -y --no-progress; "C:\Program Files\LLVM\bin" | Out-File -Append $env:GITHUB_PATH }
+      - name: Compilar
+        run: ./scripts/build-windows.ps1 -Src src -Out out/${{ matrix.pkg }} -Arch ${{ matrix.arch }}
+      - name: Comprobar dependencias (Windows 7 en x64, runtime estático en ambos)
+        run: python scripts/check-win7.py out/${{ matrix.pkg }} ${{ matrix.check }}
+      - name: Prueba
+        shell: bash
+        run: |
+          ./out/${{ matrix.pkg }}/whisper-cli.exe -m src/models/for-tests-ggml-tiny.bin -f src/samples/jfk.wav -t 2 2>&1 \
+            | tee log.txt | grep -E 'load_backend|total time'
+          grep -q 'total time' log.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.pkg }}
+          path: out/${{ matrix.pkg }}
+
+  macos-arm64:
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    env:
+      WHISPER_VERSION: ${{ needs.prepare.outputs.version }}
+    name: macOS Apple Silicon (11.0+, Metal)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Descargar whisper.cpp
+        run: git clone --depth 1 -b "$WHISPER_VERSION" https://github.com/ggml-org/whisper.cpp src
+      - name: Compilar
+        run: bash scripts/build-macos.sh arm64 src out/whisper_macos_arm64
+      - name: Comprobar y probar
+        run: |
+          otool -l out/whisper_macos_arm64/whisper-cli | grep -A3 LC_BUILD_VERSION | grep minos
+          otool -L out/whisper_macos_arm64/whisper-cli
+          ./out/whisper_macos_arm64/whisper-cli -m src/models/for-tests-ggml-tiny.bin -f src/samples/jfk.wav -t 2 2>&1 \
+            | tee log.txt | grep -E 'total time'
+          grep -q 'total time' log.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper_macos_arm64
+          path: out/whisper_macos_arm64
+
+  macos-x86_64:
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    env:
+      WHISPER_VERSION: ${{ needs.prepare.outputs.version }}
+    name: macOS Intel (${{ github.event.inputs.macos_min || '10.11' }}+)
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Descargar whisper.cpp
+        run: git clone --depth 1 -b "$WHISPER_VERSION" https://github.com/ggml-org/whisper.cpp src
+      - name: Caché de libc++
+        id: cache-libcxx
+        uses: actions/cache@v4
+        with:
+          path: libcxx
+          key: libcxx-${{ env.LLVM_VERSION }}-macos${{ env.MACOS_MIN }}-x86_64
+      - name: Compilar libc++ ${{ env.LLVM_VERSION }} para macOS ${{ env.MACOS_MIN }}
+        if: steps.cache-libcxx.outputs.cache-hit != 'true'
+        run: |
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          mkdir -p "$RUNNER_TEMP/llvm" && cd "$RUNNER_TEMP/llvm"
+          bash "$GITHUB_WORKSPACE/scripts/build-libcxx-macos.sh" "$LLVM_VERSION" "$GITHUB_WORKSPACE/libcxx"
+      - name: Compilar
+        run: bash scripts/build-macos.sh x86_64 src out/whisper_macos_x86_64 "$PWD/libcxx"
+      - name: Prueba
+        run: |
+          ./out/whisper_macos_x86_64/whisper-cli -m src/models/for-tests-ggml-tiny.bin -f src/samples/jfk.wav -t 2 2>&1 \
+            | tee log.txt | grep -E 'load_backend|total time'
+          grep -q 'total time' log.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper_macos_x86_64
+          path: out/whisper_macos_x86_64
+
+  release:
+    name: Publicar Release
+    needs: [prepare, linux, windows, macos-arm64, macos-x86_64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Empaquetar
+        run: |
+          cd dist
+          for d in */; do d=${d%/}; (cd "$d" && chmod +x whisper-cli main 2>/dev/null; zip -qry "../$d.zip" .); done
+          ls -la
+      - name: Publicar
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.prepare.outputs.version }}
+        run: |
+          gh release delete "$V" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "$V" dist/*.zip -R "$GITHUB_REPOSITORY" --latest \
+            --title "whisper.cpp $V" \
+            --notes "Compilación de [whisper.cpp $V](https://github.com/ggml-org/whisper.cpp/releases/tag/$V) para sistemas antiguos: Linux x86_64/arm64 con glibc 2.17+, Windows x64 7 SP1+, Windows arm64 10+, macOS 11+ (Apple Silicon) y macOS ${MACOS_MIN}+ (Intel)."
