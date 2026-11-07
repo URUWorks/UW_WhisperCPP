@@ -11,6 +11,8 @@ PREFIX="$1"
 : "${VULKAN_SDK_TAG:=vulkan-sdk-1.4.363.0}"
 : "${SHADERC_TAG:=v2026.4}"
 J=$(nproc)
+# manylinux2014 no trae python3 en el PATH: está en /opt/python
+PY=$(command -v python3 || ls -d /opt/python/cp3*/bin/python3 | sort -V | tail -1)
 WORK="$(mktemp -d)"
 cd "$WORK"
 
@@ -27,7 +29,7 @@ cmake --build build-loader -j"$J"
 cmake --install build-loader
 
 git clone -q --depth 1 -b "$SHADERC_TAG" https://github.com/google/shaderc
-python3 shaderc/utils/git-sync-deps
+"$PY" shaderc/utils/git-sync-deps
 # ggml-vulkan también pide SPIRV-Headers (viene dentro de shaderc)
 cmake -S shaderc/third_party/spirv-headers -B build-spirv-headers -DCMAKE_INSTALL_PREFIX="$PREFIX"
 cmake --install build-spirv-headers
