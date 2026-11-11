@@ -29,7 +29,11 @@ else
   export MACOSX_DEPLOYMENT_TARGET="$MACOS_MIN"
   [ -n "$LIBCXX" ] || { echo "falta la ruta de la libc++ propia"; exit 1; }
   CXXF="-nostdinc++ -isystem $LIBCXX/include/c++/v1"
-  LDF="-nostdlib++ -L$LIBCXX/lib -lc++ -lc++abi -Wl,-rpath,@loader_path"
+  # ggml_time_us llama a clock_gettime (macOS 10.12+): se enlaza nuestra versión en cada binario
+  COMPAT="$PWD/clock_gettime-compat.o"
+  clang -c -O2 -arch x86_64 -mmacosx-version-min="$MACOS_MIN" -o "$COMPAT" \
+    "$(cd "$(dirname "$0")" && pwd)/clock_gettime-compat-macos.c"
+  LDF="-nostdlib++ -L$LIBCXX/lib -lc++ -lc++abi -Wl,-rpath,@loader_path $COMPAT"
   cmake -S "$SRC" -B "$SRC/build-x86_64" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_OSX_ARCHITECTURES=x86_64 \
@@ -59,6 +63,10 @@ else
     MIN=$(otool -l "$f" | awk '/LC_VERSION_MIN_MACOSX/{v=1} v&&/version/{print $2; exit} /LC_BUILD_VERSION/{b=1} b&&/minos/{print $2; exit}')
     echo "$(basename "$f"): minos=$MIN"
     [ "$MIN" = "$MACOS_MIN" ] || { echo "ERROR: $f requiere macOS $MIN"; exit 1; }
+    # Funciones de libSystem posteriores a MACOS_MIN quedan "weak" y en un macOS antiguo son NULL
+    if nm -m "$f" | grep '(undefined) weak external' | grep 'from libSystem'; then
+      echo "ERROR: $f usa funciones del sistema que no existen en macOS $MACOS_MIN"; exit 1
+    fi
   done
 fi
 cp "$SRC/LICENSE" "$OUT"/LICENSE.txt

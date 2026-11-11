@@ -213,7 +213,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: libcxx
-          key: libcxx-${{ env.LLVM_VERSION }}-macos${{ env.MACOS_MIN }}-x86_64
+          key: libcxx-${{ env.LLVM_VERSION }}-macos${{ env.MACOS_MIN }}-x86_64-${{ hashFiles('scripts/build-libcxx-macos.sh', 'scripts/clock_gettime-compat-macos.c') }}
       - name: Compilar libc++ ${{ env.LLVM_VERSION }} para macOS ${{ env.MACOS_MIN }}
         if: steps.cache-libcxx.outputs.cache-hit != 'true'
         run: |

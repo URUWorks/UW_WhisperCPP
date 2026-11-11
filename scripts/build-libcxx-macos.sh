@@ -11,6 +11,10 @@ tar xf llvm.tar.xz
 # libc++ usa utimensat (macOS 10.13+); por debajo de 10.13 usamos su alternativa con utimes
 sed -i '' 's/^#if defined(UTIME_OMIT)$/#if defined(UTIME_OMIT) \&\& !(defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) \&\& __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ < 101300)/' "llvm-project-$VER.src/libcxx/src/filesystem/time_utils.h"
 grep -n 'defined(UTIME_OMIT)' "llvm-project-$VER.src/libcxx/src/filesystem/time_utils.h"
+# std::chrono llama a clock_gettime (macOS 10.12+): se enlaza nuestra versión dentro de la dylib
+COMPAT="$PWD/clock_gettime-compat.o"
+clang -c -O2 -arch x86_64 -mmacosx-version-min="$MACOS_MIN" -o "$COMPAT" \
+  "$(cd "$(dirname "$0")" && pwd)/clock_gettime-compat-macos.c"
 cmake -S "llvm-project-$VER.src/runtimes" -B build-libcxx -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_ARCHITECTURES=x86_64 \
@@ -23,7 +27,15 @@ cmake -S "llvm-project-$VER.src/runtimes" -B build-libcxx -G Ninja \
   -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXX_INCLUDE_BENCHMARKS=OFF -DLIBCXXABI_INCLUDE_TESTS=OFF \
   -DLIBCXX_INSTALL_LIBRARY_DIR=lib -DLIBCXXABI_INSTALL_LIBRARY_DIR=lib \
   -DCMAKE_INSTALL_NAME_DIR=@rpath \
+  -DCMAKE_SHARED_LINKER_FLAGS="$COMPAT" \
   -DLIBCXX_ENABLE_VENDOR_AVAILABILITY_ANNOTATIONS=OFF
 cmake --build build-libcxx
 cmake --install build-libcxx
 otool -L "$PREFIX/lib/libc++.1.dylib"
+# Ninguna función de libSystem posterior a MACOS_MIN (el compilador las enlaza "weak" y en
+# un macOS antiguo quedarían en NULL)
+for f in "$PREFIX"/lib/libc++.1.dylib "$PREFIX"/lib/libc++abi.1.dylib; do
+  if nm -m "$f" | grep '(undefined) weak external' | grep 'from libSystem'; then
+    echo "ERROR: $f usa funciones del sistema que no existen en macOS $MACOS_MIN"; exit 1
+  fi
+done

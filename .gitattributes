@@ -2,3 +2,4 @@
 *.h text eol=lf
 *.yml text eol=lf
 *.cmake text eol=lf
+*.c text eol=lf
