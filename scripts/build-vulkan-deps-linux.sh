@@ -13,6 +13,7 @@ PREFIX="$1"
 J=$(nproc)
 # manylinux2014 no trae python3 en el PATH: está en /opt/python
 PY=$(command -v python3 || ls -d /opt/python/cp3*/bin/python3 | sort -V | tail -1)
+export PATH="$(dirname "$PY"):$PATH"  # shaderc también busca Python desde CMake
 WORK="$(mktemp -d)"
 cd "$WORK"
 
